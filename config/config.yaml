@@ -1,8 +1,8 @@
-# Federated Split Learning Configuration
+# Federated Split Learning Configuration - Real Medical Datasets
 
 # Model Configuration
 model:
-  name: "microsoft/DialoGPT-medium"  # Using a smaller model for medical QA
+  name: "microsoft/DialoGPT-medium"  # Base model for medical QA
   embed_dim: 1024
   num_layers: 24
   vocab_size: 50257
@@ -67,38 +67,133 @@ federated:
   client_selection: "all"  # or "random"
   min_available_clients: 2
   
-# Data Configuration  
+# Real Medical Dataset Configuration  
 data:
-  dataset_name: "microsoft/ms_marco"  # Medical QA dataset
+  # Primary dataset source - use real medical datasets
+  dataset_source: "real_medical"  # Changed from synthetic to real
+  
+  # Dataset selection - specify which real datasets to use
+  datasets_to_use: [
+    "pubmed_qa",      # Biomedical research questions from PubMed
+    "medmcqa",        # Medical entrance exam questions (AIIMS & NEET)
+    "head_qa",        # Spanish healthcare system exam questions
+    "medical_meadow", # Medical flashcards and QA pairs
+    "medquad"         # NIH and authoritative medical sources
+  ]
+  
+  # Dataset loading parameters
+  max_samples_per_dataset: 2000  # Max samples to load from each dataset
+  combined_dataset_size: 10000   # Total samples for combined dataset
+  
+  # Data splits
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  max_samples_per_client: 10000
-  iid: false  # Non-IID data distribution
-  alpha: 0.5  # Dirichlet concentration parameter
+  
+  # Federated data distribution
+  iid: false  # Non-IID data distribution (more realistic)
+  alpha: 0.5  # Dirichlet concentration parameter for non-IID
+  
+  # Data processing
+  max_seq_length: 512
+  include_context: true  # Use context from datasets when available
+  filter_empty_answers: true  # Remove samples with empty answers
+  min_answer_length: 5  # Minimum answer length in words
+  
+  # Cache settings
+  cache_dir: "./cache/medical_datasets"
+  use_cache: true
+  force_download: false  # Set to true to re-download datasets
 
-# Optimization
+# Model Training Optimization
 optimizer:
   name: "AdamW"
   server_lr: 1e-4
   client_lr: 5e-5
   momentum: 0.9
   eps: 1e-8
+  scheduler: "cosine"  # Learning rate scheduler
+  scheduler_params:
+    warmup_ratio: 0.1
+    num_cycles: 0.5
 
-# Evaluation
+# Evaluation Configuration
 evaluation:
   eval_frequency: 10  # Every N rounds
-  metrics: ["accuracy", "f1", "bleu", "rouge", "perplexity"]
+  metrics: [
+    "accuracy", 
+    "f1", 
+    "bleu", 
+    "rouge", 
+    "perplexity",
+    "medical_terminology_accuracy",  # Custom medical metric
+    "semantic_similarity"
+  ]
   save_best_model: true
+  early_stopping:
+    patience: 20
+    min_delta: 0.001
+    monitor: "accuracy"
 
-# Logging
+# Logging and Monitoring
 logging:
   log_level: "INFO"
   log_file: "results/logs/training.log"
-  wandb_project: "federated-medical-qa"
-  save_frequency: 20
+  wandb_project: "federated-medical-qa-real-data"
+  save_frequency: 10
+  
+  # Additional logging for real datasets
+  log_dataset_stats: true
+  log_sample_predictions: true
+  log_privacy_metrics: true
 
-# Hardware
+# Hardware Configuration
 device: "cuda"
 mixed_precision: true
 dataloader_workers: 4
+pin_memory: true
+
+# Experiment Configuration
+experiment:
+  name: "federated_split_medical_qa_real_data"
+  description: "Federated split learning on real medical QA datasets"
+  tags: ["medical", "federated", "privacy", "real-data"]
+  
+# Real Dataset Specific Settings
+dataset_specific:
+  pubmed_qa:
+    subset: "pqa_labeled"  # Use labeled subset
+    max_samples: 2000
+    use_context: true  # Use abstract as context
+    
+  medmcqa:
+    max_samples: 2000
+    use_explanations: true  # Use explanations as context
+    
+  head_qa:
+    language: "en"  # Use English version
+    max_samples: 1500
+    
+  medical_meadow:
+    max_samples: 2000
+    use_instructions: true  # Use instructions as context
+    
+  medquad:
+    max_samples: 2500
+    source_filter: ["NIH", "CDC", "Mayo Clinic"]  # Filter by source
+
+# Quality Control
+quality_control:
+  min_question_length: 3  # Minimum question length in words  
+  min_answer_length: 5    # Minimum answer length in words
+  max_question_length: 100  # Maximum question length in words
+  max_answer_length: 200    # Maximum answer length in words
+  filter_duplicates: true   # Remove duplicate questions
+  language_filter: "en"     # Only English content
+  
+# Advanced Features
+advanced:
+  use_medical_embeddings: false  # Use pre-trained medical embeddings
+  medical_vocabulary_path: null  # Path to medical vocabulary
+  enable_domain_adaptation: true  # Enable domain-specific adaptations
+  use_curriculum_learning: false  # Start with easier samples
