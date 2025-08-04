@@ -226,3 +226,199 @@ class PrivacyPreservingTransmission:
             
         Returns:
             Dictionary with communication costs
+        """
+        num_elements = np.prod(original_shape)
+        
+        # Original cost (32-bit floats)
+        original_bits = num_elements * 32
+        
+        # Quantized cost
+        quantized_bits = num_elements * self.quantization_mechanism.num_bits
+        
+        # Scaling parameters cost (min, max values as 32-bit floats)
+        scaling_bits = 2 * 32  # data_min and data_max
+        
+        total_quantized_bits = quantized_bits + scaling_bits
+        
+        compression_ratio = original_bits / total_quantized_bits
+        
+        return {
+            'original_bits': original_bits,
+            'quantized_bits': total_quantized_bits,
+            'compression_ratio': compression_ratio,
+            'bandwidth_savings': 1 - (total_quantized_bits / original_bits)
+        }
+    
+    def analyze_privacy_utility_tradeoff(self, original_data: torch.Tensor, 
+                                       reconstructed_data: torch.Tensor,
+                                       delta: float = 1e-5) -> Dict[str, float]:
+        """
+        Analyze privacy-utility tradeoff
+        
+        Args:
+            original_data: Original data before privacy mechanisms
+            reconstructed_data: Data after noise + quantization + dequantization
+            delta: Privacy parameter δ
+            
+        Returns:
+            Dictionary with privacy and utility metrics
+        """
+        # Utility metrics (quantization + noise error)
+        utility_metrics = self.quantization_mechanism.compute_quantization_error(
+            original_data, reconstructed_data
+        )
+        
+        # Privacy metrics
+        sensitivity = torch.norm(original_data, p=2).item()  # L2 sensitivity
+        epsilon = self.gaussian_mechanism.compute_privacy_parameters(delta, sensitivity)
+        
+        # Privacy budget per round
+        privacy_metrics = {
+            'epsilon': epsilon,
+            'delta': delta,
+            'sigma': self.gaussian_mechanism.sigma,
+            'sensitivity': sensitivity
+        }
+        
+        return {**utility_metrics, **privacy_metrics}
+
+class DifferentialPrivacyAccountant:
+    """
+    Tracks privacy budget consumption across training rounds
+    """
+    
+    def __init__(self, total_epsilon: float, delta: float):
+        """
+        Args:
+            total_epsilon: Total privacy budget
+            delta: Privacy parameter δ
+        """
+        self.total_epsilon = total_epsilon
+        self.delta = delta
+        self.consumed_epsilon = 0.0
+        self.round_epsilons = []
+        
+    def add_round_epsilon(self, round_epsilon: float) -> bool:
+        """
+        Add epsilon consumption for current round
+        
+        Args:
+            round_epsilon: Epsilon consumed in current round
+            
+        Returns:
+            True if within budget, False if budget exceeded
+        """
+        if self.consumed_epsilon + round_epsilon > self.total_epsilon:
+            return False
+            
+        self.consumed_epsilon += round_epsilon
+        self.round_epsilons.append(round_epsilon)
+        return True
+    
+    def get_remaining_budget(self) -> float:
+        """Get remaining privacy budget"""
+        return self.total_epsilon - self.consumed_epsilon
+    
+    def compute_advanced_composition(self, num_rounds: int, round_epsilon: float) -> float:
+        """
+        Compute total epsilon using advanced composition theorem
+        
+        Args:
+            num_rounds: Number of training rounds
+            round_epsilon: Epsilon per round
+            
+        Returns:
+            Total epsilon under advanced composition
+        """
+        if round_epsilon == 0:
+            return 0.0
+            
+        # Advanced composition bound
+        term1 = math.sqrt(2 * num_rounds * math.log(1/self.delta)) * round_epsilon
+        term2 = num_rounds * round_epsilon * (math.exp(round_epsilon) - 1) / 2
+        
+        return term1 + term2
+    
+    def get_privacy_analysis(self) -> Dict[str, float]:
+        """Get comprehensive privacy analysis"""
+        num_rounds = len(self.round_epsilons)
+        
+        if num_rounds == 0:
+            return {
+                'total_epsilon': 0.0,
+                'consumed_epsilon': 0.0,
+                'remaining_epsilon': self.total_epsilon,
+                'num_rounds': 0
+            }
+        
+        # Basic composition
+        basic_composition = sum(self.round_epsilons)
+        
+        # Advanced composition (if uniform epsilon per round)
+        if len(set(self.round_epsilons)) == 1:  # All rounds have same epsilon
+            round_epsilon = self.round_epsilons[0]
+            advanced_composition = self.compute_advanced_composition(num_rounds, round_epsilon)
+        else:
+            advanced_composition = basic_composition  # Fallback to basic
+        
+        return {
+            'total_epsilon_budget': self.total_epsilon,
+            'consumed_epsilon_basic': basic_composition,
+            'consumed_epsilon_advanced': advanced_composition,
+            'remaining_epsilon': self.total_epsilon - self.consumed_epsilon,
+            'num_rounds': num_rounds,
+            'average_epsilon_per_round': np.mean(self.round_epsilons),
+            'privacy_exhausted': self.consumed_epsilon >= self.total_epsilon
+        }
+
+# Test functions
+def test_privacy_mechanisms():
+    """Test privacy mechanisms with sample data"""
+    
+    # Create sample data
+    batch_size, seq_len, embed_dim = 4, 10, 256
+    sample_data = torch.randn(batch_size, seq_len, embed_dim)
+    
+    # Initialize privacy mechanism
+    privacy_mechanism = PrivacyPreservingTransmission(sigma=0.1, num_bits=8)
+    
+    # Test transmission
+    print("Testing Privacy-Preserving Transmission...")
+    quantized_data, scaling_params = privacy_mechanism.prepare_transmission(sample_data)
+    reconstructed_data = privacy_mechanism.reconstruct_transmission(quantized_data, scaling_params)
+    
+    print(f"Original shape: {sample_data.shape}")
+    print(f"Quantized shape: {quantized_data.shape}")
+    print(f"Reconstructed shape: {reconstructed_data.shape}")
+    
+    # Analyze privacy-utility tradeoff
+    analysis = privacy_mechanism.analyze_privacy_utility_tradeoff(sample_data, reconstructed_data)
+    print("\nPrivacy-Utility Analysis:")
+    for key, value in analysis.items():
+        print(f"  {key}: {value:.6f}")
+    
+    # Communication cost analysis
+    comm_cost = privacy_mechanism.compute_communication_cost(sample_data.shape)
+    print(f"\nCommunication Cost Analysis:")
+    for key, value in comm_cost.items():
+        print(f"  {key}: {value:.4f}")
+    
+    # Test privacy accountant
+    print("\nTesting Privacy Accountant...")
+    accountant = DifferentialPrivacyAccountant(total_epsilon=1.0, delta=1e-5)
+    
+    # Simulate multiple rounds
+    for round_num in range(10):
+        round_epsilon = analysis['epsilon'] / 10  # Divide by 10 rounds
+        success = accountant.add_round_epsilon(round_epsilon)
+        if not success:
+            print(f"Privacy budget exhausted at round {round_num}")
+            break
+    
+    privacy_analysis = accountant.get_privacy_analysis()
+    print("Privacy Budget Analysis:")
+    for key, value in privacy_analysis.items():
+        print(f"  {key}: {value}")
+
+if __name__ == "__main__":
+    test_privacy_mechanisms()
