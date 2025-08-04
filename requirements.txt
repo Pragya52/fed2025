@@ -1,3 +1,5 @@
+# Updated requirements for real medical datasets
+
 # Core ML Libraries
 torch>=2.0.0
 torchvision>=0.15.0
@@ -21,6 +23,18 @@ scikit-learn>=1.3.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
+# Dataset Loading and Processing
+requests>=2.31.0
+zipfile36>=0.1.3  # For extracting downloaded datasets
+lxml>=4.9.0  # For XML parsing (MedQuAD)
+beautifulsoup4>=4.12.0  # For HTML parsing if needed
+kaggle>=1.5.16  # For Kaggle API access
+
+# Medical Data Processing
+spacy>=3.6.0  # For medical text processing
+scispacy>=0.5.3  # Scientific/medical text processing
+medspacy>=1.0.0  # Medical text processing
+
 # Utilities
 tqdm>=4.65.0
 wandb>=0.15.0
@@ -38,8 +52,17 @@ pre-commit>=3.3.0
 # Communication
 grpcio>=1.54.0
 protobuf>=4.23.0
-zmq>=0.0.0
+pyzmq>=25.0.0
 
-# Medical Data
-medspacy>=1.0.0
-scispacy>=0.5.0
+# Additional utilities for real datasets
+huggingface-hub>=0.16.0  # For HuggingFace dataset access
+fsspec>=2023.6.0  # For file system access
+aiohttp>=3.8.0  # For async HTTP requests
+nltk>=3.8.0  # For text processing metrics (BLEU, etc.)
+rouge-score>=0.1.2  # For ROUGE metrics
+sacrebleu>=2.3.1  # For BLEU metrics
+
+# Optional: For advanced medical text processing
+transformers[torch]>=4.30.0
+sentence-transformers>=2.2.0  # For semantic similarity
+biobert-pytorch>=1.0.0  # For biomedical BERT (optional)
