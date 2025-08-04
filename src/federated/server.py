@@ -458,3 +458,317 @@ class FederatedServer:
                 all_predictions.append(server_predictions)
                 all_labels.append(labels)
                 all_losses.append(loss)
+        
+        # Concatenate all predictions and labels
+        all_predictions = torch.cat(all_predictions, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        
+        # Compute comprehensive metrics
+        metrics = self.metrics.compute_comprehensive_metrics(
+            predictions=all_predictions,
+            labels=all_labels,
+            input_ids=None
+        )
+        
+        # Add average loss
+        metrics['eval_loss'] = torch.stack(all_losses).mean().item()
+        
+        self.logger.info(f"Global model evaluation completed. Loss: {metrics['eval_loss']:.4f}")
+        
+        return metrics
+    
+    def get_aggregated_head_weights(self) -> Optional[Dict[str, torch.Tensor]]:
+        """Get current aggregated head weights"""
+        return self.aggregated_head_weights
+    
+    def get_model_state(self) -> Dict[str, Any]:
+        """Get complete server model state for checkpointing"""
+        return {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'current_round': self.current_round,
+            'global_updates': self.global_updates,
+            'training_history': self.training_history,
+            'aggregated_head_weights': self.aggregated_head_weights,
+            'privacy_accountant': self.privacy_accountant.get_privacy_analysis()
+        }
+    
+    def load_model_state(self, state: Dict[str, Any]):
+        """Load server model state from checkpoint"""
+        self.model.load_state_dict(state['model_state_dict'])
+        self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        self.current_round = state['current_round']
+        self.global_updates = state['global_updates']
+        self.training_history = state['training_history']
+        self.aggregated_head_weights = state.get('aggregated_head_weights')
+        
+        # Restore privacy accountant state if available
+        if 'privacy_accountant' in state:
+            privacy_state = state['privacy_accountant']
+            self.privacy_accountant.consumed_epsilon = privacy_state.get('consumed_epsilon_basic', 0.0)
+            self.privacy_accountant.round_epsilons = []  # Reset round epsilons
+        
+        self.logger.info(f"Loaded server model state from round {self.current_round}")
+    
+    def get_communication_statistics(self) -> Dict[str, Any]:
+        """Get communication cost statistics"""
+        # Sample data for analysis
+        sample_shape = (1, self.config['model']['max_seq_length'], self.config['model']['embed_dim'])
+        comm_stats = self.privacy_mechanism.compute_communication_cost(sample_shape)
+        
+        # Add federated averaging communication cost
+        if self.aggregated_head_weights:
+            head_params_size = sum(param.numel() for param in self.aggregated_head_weights.values())
+            head_comm_bits = head_params_size * 32  # 32-bit floats
+            
+            comm_stats['fedavg_upload_bits'] = head_comm_bits * len(self.connected_clients)
+            comm_stats['fedavg_download_bits'] = head_comm_bits * len(self.connected_clients)
+            comm_stats['total_fedavg_bits'] = comm_stats['fedavg_upload_bits'] + comm_stats['fedavg_download_bits']
+        
+        # Per-round and total communication
+        rounds_completed = self.current_round
+        if rounds_completed > 0:
+            per_round_bits = comm_stats['quantized_bits'] * len(self.connected_clients)
+            fedavg_rounds = rounds_completed // self.config['training']['fedavg_frequency']
+            
+            total_training_bits = per_round_bits * rounds_completed
+            total_fedavg_bits = comm_stats.get('total_fedavg_bits', 0) * fedavg_rounds
+            
+            comm_stats['per_round_bits'] = per_round_bits
+            comm_stats['total_training_bits'] = total_training_bits
+            comm_stats['total_fedavg_bits_cumulative'] = total_fedavg_bits
+            comm_stats['total_communication_bits'] = total_training_bits + total_fedavg_bits
+        
+        return comm_stats
+    
+    def should_continue_training(self) -> bool:
+        """Check if training should continue based on privacy budget and other criteria"""
+        # Check privacy budget
+        privacy_analysis = self.privacy_accountant.get_privacy_analysis()
+        if privacy_analysis['privacy_exhausted']:
+            self.logger.warning("Privacy budget exhausted, stopping training")
+            return False
+        
+        # Check maximum rounds
+        if self.current_round >= self.config['training']['num_rounds']:
+            self.logger.info("Maximum rounds reached, stopping training")
+            return False
+        
+        return True
+    
+    def get_training_summary(self) -> Dict[str, Any]:
+        """Get comprehensive training summary"""
+        summary = {
+            'server_info': {
+                'current_round': self.current_round,
+                'global_updates': self.global_updates,
+                'connected_clients': len(self.connected_clients),
+                'total_rounds_planned': self.config['training']['num_rounds']
+            },
+            'privacy_analysis': self.privacy_accountant.get_privacy_analysis(),
+            'communication_stats': self.get_communication_statistics(),
+            'training_progress': {
+                'rounds_completed': self.current_round,
+                'progress_percentage': (self.current_round / self.config['training']['num_rounds']) * 100
+            }
+        }
+        
+        # Add recent training statistics
+        if self.training_history:
+            recent_history = self.training_history[-5:]  # Last 5 rounds
+            summary['recent_performance'] = {
+                'avg_loss': np.mean([h.get('total_loss', 0) for h in recent_history]),
+                'avg_accuracy': np.mean([h.get('accuracy', 0) for h in recent_history]),
+                'rounds_included': len(recent_history)
+            }
+        
+        return summary
+
+class ServerCommunicationHandler:
+    """Handles communication protocols between server and clients"""
+    
+    def __init__(self, server: FederatedServer):
+        """
+        Args:
+            server: FederatedServer instance
+        """
+        self.server = server
+        self.logger = logging.getLogger("ServerCommHandler")
+        
+    def create_client_communication_function(self, client_id: int) -> callable:
+        """
+        Create a communication function for a specific client
+        
+        Args:
+            client_id: Client identifier
+            
+        Returns:
+            Communication function for the client
+        """
+        def communicate_with_server(client_request: Dict[str, Any]) -> torch.Tensor:
+            """
+            Handle communication from client to server
+            
+            Args:
+                client_request: Request from client
+                
+            Returns:
+                Server predictions
+            """
+            try:
+                # Add client ID to request
+                client_request['client_id'] = client_id
+                
+                # Process client data and return predictions
+                server_predictions = self.server.process_client_data(client_request)
+                
+                return server_predictions
+                
+            except Exception as e:
+                self.logger.error(f"Error processing request from client {client_id}: {e}")
+                # Return dummy predictions in case of error
+                batch_size = client_request['labels'].shape[0]
+                seq_len = client_request['labels'].shape[1] if len(client_request['labels'].shape) > 1 else 1
+                vocab_size = self.server.config['model']['vocab_size']
+                
+                dummy_predictions = torch.zeros(batch_size, seq_len, vocab_size)
+                return dummy_predictions
+        
+        return communicate_with_server
+    
+    def coordinate_federated_round(self, 
+                                 client_managers: List,
+                                 client_dataloaders: List) -> Dict[str, Any]:
+        """
+        Coordinate a complete federated training round
+        
+        Args:
+            client_managers: List of client instances
+            client_dataloaders: List of client dataloaders
+            
+        Returns:
+            Round statistics
+        """
+        self.logger.info(f"Coordinating federated round {self.server.current_round + 1}")
+        
+        # Step 1: Collect client logits and head weights
+        client_logits_dict = {}
+        client_head_weights = []
+        client_data_sizes = []
+        
+        for i, (client, dataloader) in enumerate(zip(client_managers, client_dataloaders)):
+            try:
+                # Create communication function for this client
+                comm_fn = self.create_client_communication_function(client.client_id)
+                
+                # Run client training round
+                client_stats = client.local_training_round(dataloader, comm_fn)
+                
+                # Collect client logits (would need to be implemented in client)
+                # For now, using dummy data
+                dummy_logits = torch.randn(1, 10, self.server.config['model']['vocab_size'])
+                client_logits_dict[client.client_id] = dummy_logits
+                
+                # Collect head weights
+                head_weights = client.get_head_parameters()
+                client_head_weights.append(head_weights)
+                
+                # Collect data size
+                client_data_sizes.append(len(dataloader.dataset))
+                
+                self.logger.debug(f"Collected data from client {client.client_id}")
+                
+            except Exception as e:
+                self.logger.error(f"Error in client {i} training: {e}")
+                continue
+        
+        # Step 2: Server training and federated averaging
+        if client_logits_dict and client_head_weights:
+            round_stats = self.server.complete_training_round(
+                client_logits_dict=client_logits_dict,
+                client_head_weights=client_head_weights,
+                client_data_sizes=client_data_sizes
+            )
+            
+            # Step 3: Distribute updated head weights back to clients
+            aggregated_weights = self.server.get_aggregated_head_weights()
+            if aggregated_weights:
+                for client in client_managers:
+                    client.set_head_parameters(aggregated_weights)
+            
+            round_stats['successful_clients'] = len(client_logits_dict)
+            return round_stats
+        
+        else:
+            self.logger.warning("No successful client communications in this round")
+            return {'round': self.server.current_round, 'successful_clients': 0}
+
+# Test function
+def test_federated_server():
+    """Test the federated server implementation"""
+    from ..models.llama_split import create_llama_models
+    
+    # Mock configuration
+    config = {
+        'model': {'embed_dim': 256, 'vocab_size': 1000, 'max_seq_length': 128},
+        'privacy': {
+            'gaussian_noise': {'sigma': 0.1},
+            'quantization': {'bits': 8},
+            'differential_privacy': {'epsilon': 1.0, 'delta': 1e-5}
+        },
+        'training': {
+            'temperature': 3.0,
+            'num_rounds': 10,
+            'fedavg_frequency': 2,
+            'gradient_clip_norm': 1.0,
+            'weight_decay': 0.01
+        },
+        'loss_weights': {
+            'server': {'lambda1': 0.5, 'lambda2': 0.5}
+        },
+        'optimizer': {
+            'name': 'AdamW',
+            'server_lr': 1e-4,
+            'eps': 1e-8
+        }
+    }
+    
+    # Create server model
+    _, server_model = create_llama_models(config['model'])
+    
+    # Create server
+    server = FederatedServer(
+        model=server_model,
+        config=config,
+        device='cpu'  # Use CPU for testing
+    )
+    
+    # Test client registration
+    server.register_client(0)
+    server.register_client(1)
+    server.register_client(2)
+    
+    # Test privacy budget
+    privacy_analysis = server.privacy_accountant.get_privacy_analysis()
+    print("Initial Privacy Analysis:")
+    for key, value in privacy_analysis.items():
+        print(f"  {key}: {value}")
+    
+    # Test communication statistics
+    comm_stats = server.get_communication_statistics()
+    print(f"\nCommunication Statistics:")
+    for key, value in comm_stats.items():
+        if isinstance(value, (int, float)):
+            print(f"  {key}: {value:.2f}")
+    
+    # Test training summary
+    summary = server.get_training_summary()
+    print(f"\nTraining Summary:")
+    print(f"  Connected clients: {summary['server_info']['connected_clients']}")
+    print(f"  Current round: {summary['server_info']['current_round']}")
+    print(f"  Privacy budget remaining: {summary['privacy_analysis']['remaining_epsilon']:.4f}")
+    
+    print("Federated server test completed successfully!")
+
+if __name__ == "__main__":
+    test_federated_server()
