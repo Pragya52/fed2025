@@ -63,22 +63,31 @@ class GaussianNoiseMechanism:
 class QuantizationMechanism:
     """
     Implements quantization for communication efficiency and additional privacy
+    using the roundσ function.
     """
     
-    def __init__(self, num_bits: int = 8, device: str = 'cuda'):
+    def __init__(self, num_bits: int = 8, device: str = 'cuda', k: float = 10.0):
         """
         Args:
             num_bits: Number of bits for quantization (e.g., 8 for int8)
             device: Device to perform computations on
+            k: Steepness parameter for sigmoid function in roundσ
         """
         self.num_bits = num_bits
         self.device = device
+        self.k = k  # Steepness parameter for sigmoid
         self.max_value = 2**(num_bits - 1) - 1  # e.g., 127 for int8
         self.min_value = -2**(num_bits - 1)     # e.g., -128 for int8
         
+    def _sigmoid(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute sigmoid function σ(x) = 1 / (1 + e^(-x))
+        """
+        return torch.sigmoid(x)
+    
     def quantize(self, data: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Quantize floating-point data to integers
+        Quantize floating-point data to integers using roundσ function
         
         Args:
             data: Input tensor to quantize
@@ -97,8 +106,18 @@ class QuantizationMechanism:
         # Scale data to [0, 2^b - 1] range
         scaled_data = (data - data_min) / (data_max - data_min) * (2**self.num_bits - 1)
         
-        # Round to nearest integer and clamp to valid range
-        quantized_data = torch.round(scaled_data).clamp(0, 2**self.num_bits - 1)
+        # Apply roundσ(x, k) = Σ_n n [σ(k(x - (n - 0.5))) - σ(k(x - (n + 0.5)))]
+        n = torch.arange(0, 2**self.num_bits, device=self.device)
+        n = n.view(1, -1)  # Shape: (1, 2^num_bits)
+        
+        # Compute terms for roundσ
+        x = scaled_data.unsqueeze(-1)  # Add dimension for broadcasting
+        term1 = self._sigmoid(self.k * (x - (n)))
+        term2 = self._sigmoid(self.k * (x - (n + 1)))
+        quantized_data = torch.sum(n * (term1 - term2), dim=-1)
+        
+        # Clamp to valid range and convert to integer
+        quantized_data = torch.round(quantized_data).clamp(0, 2**self.num_bits - 1)
         
         # Convert to appropriate integer type
         if self.num_bits == 8:
