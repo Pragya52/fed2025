@@ -14,7 +14,7 @@ from copy import deepcopy
 
 from ..models.llama_split import LLaMAClientModel
 from ..models.privacy_mechanisms import PrivacyPreservingTransmission
-from ..training.losses import FederatedKnowledgeDistillationLoss
+from ..training.losses import MedicalFederatedDistillationLoss  # Fixed import
 from ..training.metrics import MedicalQAMetrics
 
 class FederatedClient:
@@ -41,17 +41,25 @@ class FederatedClient:
         self.device = device
         
         # Privacy mechanisms
+        privacy_config = config.get('privacy', {})
+        gaussian_noise = privacy_config.get('gaussian_noise', {})
+        quantization = privacy_config.get('quantization', {})
+        
         self.privacy_mechanism = PrivacyPreservingTransmission(
-            sigma=config['privacy']['gaussian_noise']['sigma'],
-            num_bits=config['privacy']['quantization']['bits'],
+            sigma=gaussian_noise.get('sigma', 0.1),
+            num_bits=quantization.get('bits', 8),
             device=device
         )
         
-        # Loss functions
-        self.loss_fn = FederatedKnowledgeDistillationLoss(
-            temperature=config['training']['temperature'],
-            alpha=config['loss_weights']['client']['mu1'],
-            beta=config['loss_weights']['client']['mu2']
+        # Loss functions - Updated to use correct class and parameter structure
+        loss_config = config.get('loss', {})
+        self.loss_fn = MedicalFederatedDistillationLoss(
+            temperature=loss_config.get('temperature', 3.0),
+            alpha=loss_config.get('distillation_weight', 0.5),
+            beta=loss_config.get('task_weight', 0.5),
+            gamma=loss_config.get('medical_weight', 0.1),
+            label_smoothing=loss_config.get('label_smoothing', 0.1),
+            medical_term_boost=loss_config.get('medical_term_boost', 2.0)
         )
         
         # Metrics
@@ -72,22 +80,59 @@ class FederatedClient:
         """Create optimizer for local training"""
         optimizer_config = self.config['optimizer']
         
-        if optimizer_config['name'] == 'AdamW':
+        # Ensure learning rate is a float (handle string values from YAML)
+        client_lr = optimizer_config.get('client_lr', 5e-5)
+        if isinstance(client_lr, str):
+            client_lr = float(client_lr)
+        
+        # Ensure weight decay is a float
+        weight_decay = self.config.get('training', {}).get('weight_decay', 0.01)
+        if isinstance(weight_decay, str):
+            weight_decay = float(weight_decay)
+        
+        # Ensure eps is a float
+        eps = optimizer_config.get('eps', 1e-8)
+        if isinstance(eps, str):
+            eps = float(eps)
+        
+        if optimizer_config.get('name', 'AdamW') == 'AdamW':
             return optim.AdamW(
                 self.model.parameters(),
-                lr=optimizer_config['client_lr'],
-                weight_decay=self.config['training']['weight_decay'],
-                eps=optimizer_config['eps']
+                lr=client_lr,
+                weight_decay=weight_decay,
+                eps=eps
             )
-        elif optimizer_config['name'] == 'SGD':
+        elif optimizer_config.get('name', 'AdamW') == 'SGD':
+            # Ensure momentum is a float
+            momentum = optimizer_config.get('momentum', 0.9)
+            if isinstance(momentum, str):
+                momentum = float(momentum)
+                
             return optim.SGD(
                 self.model.parameters(),
-                lr=optimizer_config['client_lr'],
-                momentum=optimizer_config['momentum'],
-                weight_decay=self.config['training']['weight_decay']
+                lr=client_lr,
+                momentum=momentum,
+                weight_decay=weight_decay
             )
         else:
-            raise ValueError(f"Unknown optimizer: {optimizer_config['name']}")
+            raise ValueError(f"Unknown optimizer: {optimizer_config.get('name', 'AdamW')}")
+    
+    def _create_simple_medical_mask(self, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Create a simple medical mask based on token patterns
+        This is a placeholder - in practice, you'd use medical vocabulary
+        """
+        # Simple heuristic: assume some tokens are medical terms
+        # This should be replaced with actual medical vocabulary matching
+        medical_mask = torch.zeros_like(labels, dtype=torch.bool)
+        
+        # For now, mark first few tokens as potentially medical
+        # In practice, you'd use a medical vocabulary lookup
+        seq_len = labels.size(-1)
+        medical_tokens = min(3, seq_len)  # First 3 tokens or sequence length, whichever is smaller
+        medical_mask[:, :medical_tokens] = True
+        
+        return medical_mask
     
     def local_training_step(self, 
                            batch: Dict[str, torch.Tensor],
@@ -113,20 +158,20 @@ class FederatedClient:
         # Forward pass through local model
         local_logits = self.model.forward_local(input_ids, attention_mask)
         
-        # Compute local predictions
-        local_predictions = torch.softmax(local_logits, dim=-1)
-        
         # Prepare server predictions if available
         if server_predictions is not None:
             server_predictions = server_predictions.to(self.device)
         
-        # Compute loss
+        # Create medical mask (simple heuristic - can be improved)
+        medical_mask = self._create_simple_medical_mask(labels)
+        
+        # Compute loss using the updated loss function signature
         loss_dict = self.loss_fn(
             client_logits=local_logits,
             server_logits=server_predictions,
             labels=labels,
-            client_predictions=local_predictions,
-            server_predictions=server_predictions
+            attention_mask=attention_mask,
+            medical_mask=medical_mask
         )
         
         total_loss = loss_dict['total_loss']
@@ -135,10 +180,11 @@ class FederatedClient:
         total_loss.backward()
         
         # Gradient clipping
-        if self.config['training']['gradient_clip_norm'] > 0:
+        gradient_clip_norm = self.config.get('training', {}).get('gradient_clip_norm', 1.0)
+        if gradient_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), 
-                self.config['training']['gradient_clip_norm']
+                gradient_clip_norm
             )
         
         # Optimizer step
@@ -146,14 +192,25 @@ class FederatedClient:
         
         # Compute metrics
         with torch.no_grad():
+            # Compute local predictions for metrics
+            local_predictions = torch.softmax(local_logits, dim=-1)
+            
             metrics = self.metrics.compute_batch_metrics(
                 predictions=local_predictions,
                 labels=labels,
                 input_ids=input_ids
             )
         
-        # Combine loss and metrics
-        result = {**loss_dict, **metrics}
+        # Combine loss and metrics (convert tensors to floats)
+        result = {}
+        for key, value in loss_dict.items():
+            if isinstance(value, torch.Tensor):
+                result[key] = value.item()
+            else:
+                result[key] = value
+        
+        # Add metrics
+        result.update(metrics)
         
         return result
     
@@ -200,7 +257,9 @@ class FederatedClient:
         
         self.logger.info(f"Starting local training round {self.current_round}")
         
-        for epoch in range(self.config['training']['local_epochs']):
+        local_epochs = self.config.get('training', {}).get('local_epochs', 2)
+        
+        for epoch in range(local_epochs):
             epoch_stats = {'losses': [], 'metrics': []}
             
             for batch_idx, batch in enumerate(dataloader):
@@ -340,16 +399,21 @@ class FederatedClient:
                 
                 # Forward pass
                 local_logits = self.model.forward_local(input_ids, attention_mask)
-                local_predictions = torch.softmax(local_logits, dim=-1)
+                
+                # Create medical mask for evaluation
+                medical_mask = self._create_simple_medical_mask(labels)
                 
                 # Compute loss (without server predictions for evaluation)
                 loss_dict = self.loss_fn(
                     client_logits=local_logits,
                     server_logits=None,  # No server predictions during evaluation
                     labels=labels,
-                    client_predictions=local_predictions,
-                    server_predictions=None
+                    attention_mask=attention_mask,
+                    medical_mask=medical_mask
                 )
+                
+                # Compute local predictions for metrics
+                local_predictions = torch.softmax(local_logits, dim=-1)
                 
                 all_predictions.append(local_predictions)
                 all_labels.append(labels)
@@ -358,6 +422,14 @@ class FederatedClient:
         # Concatenate all predictions and labels
         all_predictions = torch.cat(all_predictions, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
+        
+        # Move to CPU to save memory
+        all_predictions = all_predictions.cpu()
+        all_labels = all_labels.cpu()
+        
+        # Clear GPU cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Compute comprehensive metrics
         metrics = self.metrics.compute_comprehensive_metrics(
@@ -376,15 +448,17 @@ class FederatedClient:
     def get_privacy_analysis(self) -> Dict[str, float]:
         """Get privacy analysis for this client"""
         # Create sample data for analysis
-        sample_data = torch.randn(1, 10, self.config['model']['embed_dim'], device=self.device)
+        embed_dim = self.config.get('model', {}).get('embed_dim', 4096)
+        sample_data = torch.randn(1, 10, embed_dim, device=self.device)
         
         # Prepare transmission
         quantized_data, scaling_params = self.privacy_mechanism.prepare_transmission(sample_data)
         reconstructed_data = self.privacy_mechanism.reconstruct_transmission(quantized_data, scaling_params)
         
         # Analyze privacy-utility tradeoff
+        delta = self.config.get('privacy', {}).get('differential_privacy', {}).get('delta', 1e-5)
         analysis = self.privacy_mechanism.analyze_privacy_utility_tradeoff(
-            sample_data, reconstructed_data, delta=self.config['privacy']['differential_privacy']['delta']
+            sample_data, reconstructed_data, delta=delta
         )
         
         return analysis
@@ -509,13 +583,17 @@ def test_federated_client():
             'differential_privacy': {'delta': 1e-5}
         },
         'training': {
-            'temperature': 3.0,
             'local_epochs': 2,
             'gradient_clip_norm': 1.0,
             'weight_decay': 0.01
         },
-        'loss_weights': {
-            'client': {'mu1': 0.5, 'mu2': 0.5}
+        'loss': {
+            'temperature': 3.0,
+            'distillation_weight': 0.5,
+            'task_weight': 0.5,
+            'medical_weight': 0.1,
+            'label_smoothing': 0.1,
+            'medical_term_boost': 2.0
         },
         'optimizer': {
             'name': 'AdamW',
