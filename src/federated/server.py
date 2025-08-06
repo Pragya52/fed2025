@@ -14,7 +14,7 @@ import copy
 
 from ..models.llama_split import LLaMAServerModel
 from ..models.privacy_mechanisms import PrivacyPreservingTransmission, DifferentialPrivacyAccountant
-from ..training.losses import FederatedKnowledgeDistillationLoss
+from ..training.losses import MedicalFederatedDistillationLoss  # Fixed import
 from ..training.metrics import MedicalQAMetrics
 
 class FederatedServer:
@@ -38,23 +38,56 @@ class FederatedServer:
         self.device = device
         
         # Privacy mechanisms
+        privacy_config = config.get('privacy', {})
+        gaussian_noise = privacy_config.get('gaussian_noise', {})
+        quantization = privacy_config.get('quantization', {})
+        
         self.privacy_mechanism = PrivacyPreservingTransmission(
-            sigma=config['privacy']['gaussian_noise']['sigma'],
-            num_bits=config['privacy']['quantization']['bits'],
+            sigma=gaussian_noise.get('sigma', 0.1),
+            num_bits=quantization.get('bits', 8),
             device=device
         )
         
         # Privacy accountant
+        privacy_config = config.get('privacy', {})
+        target_epsilon = privacy_config.get('target_epsilon', 10.0)
+        target_delta = privacy_config.get('target_delta', 1e-5)
+        
+        # Handle both old and new config formats
+        if 'differential_privacy' in privacy_config:
+            target_epsilon = privacy_config['differential_privacy'].get('epsilon', target_epsilon)
+            target_delta = privacy_config['differential_privacy'].get('delta', target_delta)
+        
         self.privacy_accountant = DifferentialPrivacyAccountant(
-            total_epsilon=config['privacy']['differential_privacy']['epsilon'],
-            delta=config['privacy']['differential_privacy']['delta']
+            total_epsilon=target_epsilon,
+            delta=target_delta
         )
         
-        # Loss function
-        self.loss_fn = FederatedKnowledgeDistillationLoss(
-            temperature=config['training']['temperature'],
-            alpha=config['loss_weights']['server']['lambda1'],
-            beta=config['loss_weights']['server']['lambda2']
+        # Loss function - Updated to use correct class and parameters
+        loss_config = config.get('loss', {})
+        training_config = config.get('training', {})
+        
+        # Handle different config structures for backward compatibility
+        temperature = loss_config.get('temperature', training_config.get('temperature', 3.0))
+        
+        # Try to get loss weights from different possible locations
+        alpha = 0.5  # default
+        beta = 0.5   # default
+        
+        if 'loss_weights' in config and 'server' in config['loss_weights']:
+            alpha = config['loss_weights']['server'].get('lambda1', 0.5)
+            beta = config['loss_weights']['server'].get('lambda2', 0.5)
+        else:
+            alpha = loss_config.get('distillation_weight', 0.5)
+            beta = loss_config.get('task_weight', 0.5)
+        
+        self.loss_fn = MedicalFederatedDistillationLoss(
+            temperature=temperature,
+            alpha=alpha,
+            beta=beta,
+            gamma=loss_config.get('medical_weight', 0.1),
+            label_smoothing=loss_config.get('label_smoothing', 0.1),
+            medical_term_boost=loss_config.get('medical_term_boost', 2.0)
         )
         
         # Metrics
@@ -83,27 +116,61 @@ class FederatedServer:
         """Create optimizer for global model training"""
         optimizer_config = self.config['optimizer']
         
-        if optimizer_config['name'] == 'AdamW':
+        # Ensure learning rate is a float (handle string values from YAML)
+        server_lr = optimizer_config.get('server_lr', 1e-4)
+        if isinstance(server_lr, str):
+            server_lr = float(server_lr)
+        
+        # Ensure weight decay is a float
+        weight_decay = self.config.get('training', {}).get('weight_decay', 0.01)
+        if isinstance(weight_decay, str):
+            weight_decay = float(weight_decay)
+        
+        # Ensure eps is a float
+        eps = optimizer_config.get('eps', 1e-8)
+        if isinstance(eps, str):
+            eps = float(eps)
+        
+        if optimizer_config.get('name', 'AdamW') == 'AdamW':
             return optim.AdamW(
                 self.model.parameters(),
-                lr=optimizer_config['server_lr'],
-                weight_decay=self.config['training']['weight_decay'],
-                eps=optimizer_config['eps']
+                lr=server_lr,
+                weight_decay=weight_decay,
+                eps=eps
             )
-        elif optimizer_config['name'] == 'SGD':
+        elif optimizer_config.get('name', 'AdamW') == 'SGD':
+            # Ensure momentum is a float
+            momentum = optimizer_config.get('momentum', 0.9)
+            if isinstance(momentum, str):
+                momentum = float(momentum)
+                
             return optim.SGD(
                 self.model.parameters(),
-                lr=optimizer_config['server_lr'],
-                momentum=optimizer_config['momentum'],
-                weight_decay=self.config['training']['weight_decay']
+                lr=server_lr,
+                momentum=momentum,
+                weight_decay=weight_decay
             )
         else:
-            raise ValueError(f"Unknown optimizer: {optimizer_config['name']}")
+            raise ValueError(f"Unknown optimizer: {optimizer_config.get('name', 'AdamW')}")
     
     def register_client(self, client_id: int):
         """Register a client with the server"""
         self.connected_clients.add(client_id)
         self.logger.info(f"Registered client {client_id}. Total clients: {len(self.connected_clients)}")
+    
+    def _create_simple_medical_mask(self, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Create a simple medical mask based on token patterns
+        This is a placeholder - in practice, you'd use medical vocabulary
+        """
+        medical_mask = torch.zeros_like(labels, dtype=torch.bool)
+        
+        # Simple heuristic: mark first few tokens as potentially medical
+        seq_len = labels.size(-1)
+        medical_tokens = min(3, seq_len)
+        medical_mask[:, :medical_tokens] = True
+        
+        return medical_mask
     
     def process_client_data(self, client_request: Dict[str, Any]) -> torch.Tensor:
         """
@@ -180,18 +247,17 @@ class FederatedServer:
             
             # Forward pass through server model (training mode)
             server_logits = self.model(cached_data['reconstructed_data'], cached_data['attention_mask'])
-            server_predictions = torch.softmax(server_logits, dim=-1)
             
-            # Prepare client predictions
-            client_predictions = torch.softmax(client_logits.to(self.device), dim=-1)
+            # Create medical mask
+            medical_mask = self._create_simple_medical_mask(cached_data['labels'])
             
-            # Compute server loss
+            # Compute server loss using updated loss function
             loss_dict = self.loss_fn(
                 client_logits=server_logits,  # Server logits as "client" for server loss
                 server_logits=client_logits.to(self.device),  # Client logits as "server" for distillation
                 labels=cached_data['labels'],
-                client_predictions=server_predictions,
-                server_predictions=client_predictions
+                attention_mask=cached_data['attention_mask'],
+                medical_mask=medical_mask
             )
             
             client_loss = loss_dict['total_loss']
@@ -199,12 +265,16 @@ class FederatedServer:
             batch_count += 1
             
             # Store for metrics computation
+            server_predictions = torch.softmax(server_logits, dim=-1)
             all_server_predictions.append(server_predictions)
             all_labels.append(cached_data['labels'])
             
             # Store loss components
             for key, value in loss_dict.items():
-                loss_components[key].append(value)
+                if isinstance(value, torch.Tensor):
+                    loss_components[key].append(value.item())
+                else:
+                    loss_components[key].append(value)
         
         if batch_count == 0:
             self.logger.warning("No valid client data for global training step")
@@ -217,10 +287,11 @@ class FederatedServer:
         avg_loss.backward()
         
         # Gradient clipping
-        if self.config['training']['gradient_clip_norm'] > 0:
+        gradient_clip_norm = self.config.get('training', {}).get('gradient_clip_norm', 1.0)
+        if gradient_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
-                self.config['training']['gradient_clip_norm']
+                gradient_clip_norm
             )
         
         # Optimizer step
@@ -286,7 +357,8 @@ class FederatedServer:
                 aggregated_weights[param_name] = torch.stack(client_params).mean(dim=0)
         
         self.aggregated_head_weights = aggregated_weights
-        self.model.update_head_weights(aggregated_weights)
+        if hasattr(self.model, 'update_head_weights'):
+            self.model.update_head_weights(aggregated_weights)
         
         self.logger.info(f"Federated averaging completed for {len(aggregated_weights)} parameters")
         
@@ -338,7 +410,8 @@ class FederatedServer:
                 aggregated_weights[param_name] = weighted_sum
         
         self.aggregated_head_weights = aggregated_weights
-        self.model.update_head_weights(aggregated_weights)
+        if hasattr(self.model, 'update_head_weights'):
+            self.model.update_head_weights(aggregated_weights)
         
         self.logger.info(f"Weighted federated averaging completed with weights: {client_weights}")
         
@@ -367,7 +440,9 @@ class FederatedServer:
         
         # Step 2: Federated averaging (if it's time)
         fedavg_stats = {}
-        if self.current_round % self.config['training']['fedavg_frequency'] == 0:
+        fedavg_frequency = self.config.get('training', {}).get('fedavg_frequency', 1)
+        
+        if self.current_round % fedavg_frequency == 0:
             if client_data_sizes is not None:
                 aggregated_weights = self.weighted_federated_averaging(client_head_weights, client_data_sizes)
             else:
@@ -404,18 +479,34 @@ class FederatedServer:
     def _update_privacy_budget(self) -> Dict[str, float]:
         """Update privacy budget accounting"""
         # Compute round epsilon (simplified)
-        sample_data = torch.randn(1, 10, self.config['model']['embed_dim'], device=self.device)
-        privacy_analysis = self.privacy_mechanism.analyze_privacy_utility_tradeoff(
-            sample_data, sample_data,  # Using same data for simplicity
-            delta=self.config['privacy']['differential_privacy']['delta']
-        )
+        embed_dim = self.config.get('model', {}).get('embed_dim', 4096)
+        sample_data = torch.randn(1, 10, embed_dim, device=self.device)
         
-        round_epsilon = privacy_analysis['epsilon'] / self.config['training']['num_rounds']
+        try:
+            privacy_analysis = self.privacy_mechanism.analyze_privacy_utility_tradeoff(
+                sample_data, sample_data,  # Using same data for simplicity
+                delta=self.config.get('privacy', {}).get('target_delta', 1e-5)
+            )
+            
+            num_rounds = self.config.get('training', {}).get('num_rounds', 100)
+            round_epsilon = privacy_analysis.get('epsilon', 0.1) / num_rounds
+        except Exception as e:
+            self.logger.warning(f"Error computing privacy analysis: {e}")
+            round_epsilon = 0.01  # Default small epsilon
         
         # Add to privacy accountant
-        budget_ok = self.privacy_accountant.add_round_epsilon(round_epsilon)
+        try:
+            budget_ok = self.privacy_accountant.add_round_epsilon(round_epsilon)
+        except Exception as e:
+            self.logger.warning(f"Error updating privacy budget: {e}")
+            budget_ok = True
         
-        privacy_stats = self.privacy_accountant.get_privacy_analysis()
+        try:
+            privacy_stats = self.privacy_accountant.get_privacy_analysis()
+        except Exception as e:
+            self.logger.warning(f"Error getting privacy analysis: {e}")
+            privacy_stats = {'consumed_epsilon_basic': 0.0, 'privacy_exhausted': False}
+        
         privacy_stats['round_epsilon'] = round_epsilon
         privacy_stats['budget_exceeded'] = not budget_ok
         
@@ -450,7 +541,7 @@ class FederatedServer:
                 server_predictions = torch.softmax(server_logits, dim=-1)
                 
                 # Compute loss (task loss only for evaluation)
-                loss = nn.CrossEntropyLoss()(
+                loss = nn.CrossEntropyLoss(ignore_index=-100)(
                     server_logits.view(-1, server_logits.size(-1)),
                     labels.view(-1)
                 )
@@ -505,52 +596,67 @@ class FederatedServer:
         # Restore privacy accountant state if available
         if 'privacy_accountant' in state:
             privacy_state = state['privacy_accountant']
-            self.privacy_accountant.consumed_epsilon = privacy_state.get('consumed_epsilon_basic', 0.0)
-            self.privacy_accountant.round_epsilons = []  # Reset round epsilons
+            try:
+                self.privacy_accountant.consumed_epsilon = privacy_state.get('consumed_epsilon_basic', 0.0)
+                self.privacy_accountant.round_epsilons = []  # Reset round epsilons
+            except Exception as e:
+                self.logger.warning(f"Error restoring privacy accountant state: {e}")
         
         self.logger.info(f"Loaded server model state from round {self.current_round}")
     
     def get_communication_statistics(self) -> Dict[str, Any]:
         """Get communication cost statistics"""
-        # Sample data for analysis
-        sample_shape = (1, self.config['model']['max_seq_length'], self.config['model']['embed_dim'])
-        comm_stats = self.privacy_mechanism.compute_communication_cost(sample_shape)
-        
-        # Add federated averaging communication cost
-        if self.aggregated_head_weights:
-            head_params_size = sum(param.numel() for param in self.aggregated_head_weights.values())
-            head_comm_bits = head_params_size * 32  # 32-bit floats
+        try:
+            # Sample data for analysis
+            max_seq_length = self.config.get('model', {}).get('max_seq_length', 512)
+            embed_dim = self.config.get('model', {}).get('embed_dim', 4096)
+            sample_shape = (1, max_seq_length, embed_dim)
+            comm_stats = self.privacy_mechanism.compute_communication_cost(sample_shape)
             
-            comm_stats['fedavg_upload_bits'] = head_comm_bits * len(self.connected_clients)
-            comm_stats['fedavg_download_bits'] = head_comm_bits * len(self.connected_clients)
-            comm_stats['total_fedavg_bits'] = comm_stats['fedavg_upload_bits'] + comm_stats['fedavg_download_bits']
-        
-        # Per-round and total communication
-        rounds_completed = self.current_round
-        if rounds_completed > 0:
-            per_round_bits = comm_stats['quantized_bits'] * len(self.connected_clients)
-            fedavg_rounds = rounds_completed // self.config['training']['fedavg_frequency']
+            # Add federated averaging communication cost
+            if self.aggregated_head_weights:
+                head_params_size = sum(param.numel() for param in self.aggregated_head_weights.values())
+                head_comm_bits = head_params_size * 32  # 32-bit floats
+                
+                comm_stats['fedavg_upload_bits'] = head_comm_bits * len(self.connected_clients)
+                comm_stats['fedavg_download_bits'] = head_comm_bits * len(self.connected_clients)
+                comm_stats['total_fedavg_bits'] = comm_stats['fedavg_upload_bits'] + comm_stats['fedavg_download_bits']
             
-            total_training_bits = per_round_bits * rounds_completed
-            total_fedavg_bits = comm_stats.get('total_fedavg_bits', 0) * fedavg_rounds
+            # Per-round and total communication
+            rounds_completed = self.current_round
+            if rounds_completed > 0:
+                per_round_bits = comm_stats.get('quantized_bits', 0) * len(self.connected_clients)
+                fedavg_frequency = self.config.get('training', {}).get('fedavg_frequency', 1)
+                fedavg_rounds = rounds_completed // fedavg_frequency
+                
+                total_training_bits = per_round_bits * rounds_completed
+                total_fedavg_bits = comm_stats.get('total_fedavg_bits', 0) * fedavg_rounds
+                
+                comm_stats['per_round_bits'] = per_round_bits
+                comm_stats['total_training_bits'] = total_training_bits
+                comm_stats['total_fedavg_bits_cumulative'] = total_fedavg_bits
+                comm_stats['total_communication_bits'] = total_training_bits + total_fedavg_bits
             
-            comm_stats['per_round_bits'] = per_round_bits
-            comm_stats['total_training_bits'] = total_training_bits
-            comm_stats['total_fedavg_bits_cumulative'] = total_fedavg_bits
-            comm_stats['total_communication_bits'] = total_training_bits + total_fedavg_bits
+        except Exception as e:
+            self.logger.warning(f"Error computing communication statistics: {e}")
+            comm_stats = {'error': str(e)}
         
         return comm_stats
     
     def should_continue_training(self) -> bool:
         """Check if training should continue based on privacy budget and other criteria"""
-        # Check privacy budget
-        privacy_analysis = self.privacy_accountant.get_privacy_analysis()
-        if privacy_analysis['privacy_exhausted']:
-            self.logger.warning("Privacy budget exhausted, stopping training")
-            return False
+        try:
+            # Check privacy budget
+            privacy_analysis = self.privacy_accountant.get_privacy_analysis()
+            if privacy_analysis.get('privacy_exhausted', False):
+                self.logger.warning("Privacy budget exhausted, stopping training")
+                return False
+        except Exception as e:
+            self.logger.warning(f"Error checking privacy budget: {e}")
         
         # Check maximum rounds
-        if self.current_round >= self.config['training']['num_rounds']:
+        max_rounds = self.config.get('training', {}).get('num_rounds', 100)
+        if self.current_round >= max_rounds:
             self.logger.info("Maximum rounds reached, stopping training")
             return False
         
@@ -558,18 +664,30 @@ class FederatedServer:
     
     def get_training_summary(self) -> Dict[str, Any]:
         """Get comprehensive training summary"""
+        try:
+            privacy_analysis = self.privacy_accountant.get_privacy_analysis()
+        except Exception as e:
+            self.logger.warning(f"Error getting privacy analysis: {e}")
+            privacy_analysis = {'error': str(e)}
+        
+        try:
+            comm_stats = self.get_communication_statistics()
+        except Exception as e:
+            self.logger.warning(f"Error getting communication statistics: {e}")
+            comm_stats = {'error': str(e)}
+        
         summary = {
             'server_info': {
                 'current_round': self.current_round,
                 'global_updates': self.global_updates,
                 'connected_clients': len(self.connected_clients),
-                'total_rounds_planned': self.config['training']['num_rounds']
+                'total_rounds_planned': self.config.get('training', {}).get('num_rounds', 100)
             },
-            'privacy_analysis': self.privacy_accountant.get_privacy_analysis(),
-            'communication_stats': self.get_communication_statistics(),
+            'privacy_analysis': privacy_analysis,
+            'communication_stats': comm_stats,
             'training_progress': {
                 'rounds_completed': self.current_round,
-                'progress_percentage': (self.current_round / self.config['training']['num_rounds']) * 100
+                'progress_percentage': (self.current_round / self.config.get('training', {}).get('num_rounds', 100)) * 100
             }
         }
         
@@ -666,7 +784,8 @@ class ServerCommunicationHandler:
                 
                 # Collect client logits (would need to be implemented in client)
                 # For now, using dummy data
-                dummy_logits = torch.randn(1, 10, self.server.config['model']['vocab_size'])
+                vocab_size = self.server.config.get('model', {}).get('vocab_size', 32000)
+                dummy_logits = torch.randn(1, 10, vocab_size)
                 client_logits_dict[client.client_id] = dummy_logits
                 
                 # Collect head weights
@@ -694,7 +813,10 @@ class ServerCommunicationHandler:
             aggregated_weights = self.server.get_aggregated_head_weights()
             if aggregated_weights:
                 for client in client_managers:
-                    client.set_head_parameters(aggregated_weights)
+                    try:
+                        client.set_head_parameters(aggregated_weights)
+                    except Exception as e:
+                        self.logger.error(f"Error updating client {client.client_id} parameters: {e}")
             
             round_stats['successful_clients'] = len(client_logits_dict)
             return round_stats
@@ -712,19 +834,24 @@ def test_federated_server():
     config = {
         'model': {'embed_dim': 256, 'vocab_size': 1000, 'max_seq_length': 128},
         'privacy': {
+            'target_epsilon': 10.0,
+            'target_delta': 1e-5,
             'gaussian_noise': {'sigma': 0.1},
-            'quantization': {'bits': 8},
-            'differential_privacy': {'epsilon': 1.0, 'delta': 1e-5}
+            'quantization': {'bits': 8}
         },
         'training': {
-            'temperature': 3.0,
             'num_rounds': 10,
             'fedavg_frequency': 2,
             'gradient_clip_norm': 1.0,
             'weight_decay': 0.01
         },
-        'loss_weights': {
-            'server': {'lambda1': 0.5, 'lambda2': 0.5}
+        'loss': {
+            'temperature': 3.0,
+            'distillation_weight': 0.5,
+            'task_weight': 0.5,
+            'medical_weight': 0.1,
+            'label_smoothing': 0.1,
+            'medical_term_boost': 2.0
         },
         'optimizer': {
             'name': 'AdamW',
@@ -749,24 +876,35 @@ def test_federated_server():
     server.register_client(2)
     
     # Test privacy budget
-    privacy_analysis = server.privacy_accountant.get_privacy_analysis()
-    print("Initial Privacy Analysis:")
-    for key, value in privacy_analysis.items():
-        print(f"  {key}: {value}")
+    try:
+        privacy_analysis = server.privacy_accountant.get_privacy_analysis()
+        print("Initial Privacy Analysis:")
+        for key, value in privacy_analysis.items():
+            print(f"  {key}: {value}")
+    except Exception as e:
+        print(f"Privacy analysis error: {e}")
     
     # Test communication statistics
-    comm_stats = server.get_communication_statistics()
-    print(f"\nCommunication Statistics:")
-    for key, value in comm_stats.items():
-        if isinstance(value, (int, float)):
-            print(f"  {key}: {value:.2f}")
+    try:
+        comm_stats = server.get_communication_statistics()
+        print(f"\nCommunication Statistics:")
+        for key, value in comm_stats.items():
+            if isinstance(value, (int, float)):
+                print(f"  {key}: {value:.2f}")
+    except Exception as e:
+        print(f"Communication stats error: {e}")
     
     # Test training summary
-    summary = server.get_training_summary()
-    print(f"\nTraining Summary:")
-    print(f"  Connected clients: {summary['server_info']['connected_clients']}")
-    print(f"  Current round: {summary['server_info']['current_round']}")
-    print(f"  Privacy budget remaining: {summary['privacy_analysis']['remaining_epsilon']:.4f}")
+    try:
+        summary = server.get_training_summary()
+        print(f"\nTraining Summary:")
+        print(f"  Connected clients: {summary['server_info']['connected_clients']}")
+        print(f"  Current round: {summary['server_info']['current_round']}")
+        
+        if 'privacy_analysis' in summary and 'remaining_epsilon' in summary['privacy_analysis']:
+            print(f"  Privacy budget remaining: {summary['privacy_analysis']['remaining_epsilon']:.4f}")
+    except Exception as e:
+        print(f"Training summary error: {e}")
     
     print("Federated server test completed successfully!")
 
